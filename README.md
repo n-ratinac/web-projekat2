@@ -16,4 +16,9 @@ U powershell-u, otići u neki direktorijum gde imate pune permisije i izvršiti 
 git clone https://github.com/n-ratinac/web-projekat2.git
 code web-projekat2
 ```
-## Tim B POBEDJUJE TRENUTNO
+
+## Podešavanje python paketa
+
+```sh
+pip install -r requirements.txt
+```

@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="sr">
+  <head>
+    <meta charset="UTF-8" />
+    <title>WS Test</title>
+  </head>
+  <body>
+    <h2>WebSocket Test</h2>
+    <button onclick="connect()">Poveži se</button>
+    <button onclick="disconnect()">Odspoji se</button>
+    <input id="msg" placeholder="Poruka..." />
+    <button onclick="sendMsg()">Pošalji</button>
+    <pre id="log"></pre>
+
+    <script>
+      let ws = null;
+      // Generate or get session_id for this tab
+      if (!sessionStorage.session_id) {
+        sessionStorage.session_id = Math.random().toString(36).substr(2, 12);
+      }
+      const session_id = sessionStorage.session_id;
+
+      function log(msg) {
+        document.getElementById("log").textContent += msg + "\n";
+      }
+
+      function connect() {
+        if (ws && ws.readyState === 1) {
+          log("Već ste povezani.");
+          return;
+        }
+        ws = new WebSocket("ws://localhost:8765");
+
+        ws.onopen = () => {
+          log("Konekcija uspostavljena.");
+          ws.send(JSON.stringify({ type: "hello", session_id }));
+        };
+        ws.onmessage = (e) => {
+          try {
+            const data = JSON.parse(e.data);
+            if (data.type === "welcome") {
+              log("Dobrodošli! Vaš session_id: " + data.session_id);
+            } else if (data.type === "msg") {
+              log(`[${data.from}] ${data.text}`);
+            } else if (data.type === "error") {
+              log("Greška: " + data.msg);
+            } else {
+              log("Primljeno: " + e.data);
+            }
+          } catch {
+            log("Primljeno: " + e.data);
+          }
+        };
+        ws.onclose = () => log("Konekcija zatvorena.");
+        ws.onerror = () => log("Greška.");
+      }
+
+      function disconnect() {
+        if (ws) ws.close();
+      }
+
+      function sendMsg() {
+        const input = document.getElementById("msg");
+        const text = input.value.trim();
+        if (ws && ws.readyState === 1 && text) {
+          ws.send(JSON.stringify({ type: "msg", text }));
+          input.value = "";
+        }
+      }
+    </script>
+  </body>
+</html>
+s
