@@ -13,239 +13,98 @@
       body {
         background: #111;
         overflow: hidden;
-        font-family: "Segoe UI", sans-serif;
-      }
-      canvas {
-        display: block;
-      }
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+          <meta charset="UTF-8">
+          <title>Agar.io Multiplayer Demo</title>
+          <style>
+            html, body { height: 100%; margin: 0; overflow: hidden; }
+            body { background: #222; }
+            canvas { display: block; margin: 0 auto; background: #fff; border: 2px solid #333; }
+          </style>
+        </head>
+        <body>
+        <canvas id="game" width="800" height="600"></canvas>
+        <script>
+        const canvas = document.getElementById('game');
+        const ctx = canvas.getContext('2d');
+        const WORLD_WIDTH = 800;
+        const WORLD_HEIGHT = 600;
+        let session_id = Math.random().toString(36).substr(2, 9);
+        let ws;
+        let myId = session_id;
+        let state = { players: {} };
+        let mouse = { x: WORLD_WIDTH/2, y: WORLD_HEIGHT/2 };
 
-      #ui {
-        position: fixed;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 100%;
-        pointer-events: none;
-        z-index: 10;
-      }
+        function connect() {
+          ws = new WebSocket('ws://localhost:8765');
+          ws.onopen = () => {
+            ws.send(JSON.stringify({type: 'hello', session_id: myId}));
+          };
+          ws.onmessage = (ev) => {
+            let msg = JSON.parse(ev.data);
+            if (msg.type === 'welcome') {
+              // ok
+            } else if (msg.type === 'state') {
+              state = msg.state;
+            } else if (msg.type === 'error') {
+              alert(msg.msg);
+            }
+          };
+          ws.onclose = () => {
+            setTimeout(connect, 1000);
+          };
+        }
+        connect();
 
-      #score {
-        position: absolute;
-        top: 18px;
-        right: 24px;
-        color: #fff;
-        font-size: 22px;
-        font-weight: 700;
-        text-shadow: 0 2px 8px rgba(0, 0, 0, 0.7);
-        letter-spacing: 1px;
-      }
+        canvas.addEventListener('mousemove', e => {
+          const rect = canvas.getBoundingClientRect();
+          mouse.x = e.clientX - rect.left;
+          mouse.y = e.clientY - rect.top;
+        });
 
-      #leaderboard {
-        position: absolute;
-        top: 18px;
-        left: 24px;
-        color: #fff;
-        font-size: 13px;
-        background: rgba(0, 0, 0, 0.45);
-        padding: 10px 16px;
-        border-radius: 10px;
-        min-width: 140px;
-        backdrop-filter: blur(4px);
-      }
-      #leaderboard h3 {
-        font-size: 12px;
-        letter-spacing: 2px;
-        text-transform: uppercase;
-        color: #aaa;
-        margin-bottom: 6px;
-      }
-      #leaderboard .entry {
-        padding: 2px 0;
-      }
-      #leaderboard .entry.me {
-        color: #7ef7a0;
-        font-weight: 700;
-      }
+        function sendMove() {
+          if (!state.players[myId]) return;
+          const me = state.players[myId];
+          const dx = mouse.x - me.x;
+          const dy = mouse.y - me.y;
+          const len = Math.sqrt(dx*dx + dy*dy);
+          let vx = 0, vy = 0;
+          if (len > 1) {
+            vx = dx / len;
+            vy = dy / len;
+          }
+          if (ws && ws.readyState === 1) {
+            ws.send(JSON.stringify({type: 'move', dx: vx, dy: vy}));
+          }
+        }
 
-      #minimap {
-        position: absolute;
-        bottom: 18px;
-        right: 18px;
-        width: 130px;
-        height: 130px;
-        border: 2px solid rgba(255, 255, 255, 0.2);
-        border-radius: 8px;
-        background: rgba(0, 0, 0, 0.4);
-        overflow: hidden;
-      }
-      #minimap canvas {
-        width: 130px;
-        height: 130px;
-      }
+        function render() {
+          ctx.clearRect(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
+          // Draw all players
+          for (const [sid, p] of Object.entries(state.players)) {
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, sid === myId ? 20 : 15, 0, 2*Math.PI);
+            ctx.fillStyle = sid === myId ? '#4af' : '#aaa';
+            ctx.fill();
+            ctx.strokeStyle = '#222';
+            ctx.stroke();
+            ctx.font = '12px Arial';
+            ctx.fillStyle = '#222';
+            ctx.fillText(sid === myId ? 'You' : sid, p.x-15, p.y-20);
+          }
+        }
 
-      #overlay {
-        position: fixed;
-        inset: 0;
-        background: rgba(10, 10, 20, 0.92);
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        z-index: 100;
-        pointer-events: all;
-      }
-      #overlay h1 {
-        font-size: 64px;
-        font-weight: 900;
-        color: #7ef7a0;
-        letter-spacing: -2px;
-        text-shadow: 0 0 40px rgba(126, 247, 160, 0.5);
-        margin-bottom: 8px;
-      }
-      #overlay p {
-        color: #888;
-        font-size: 15px;
-        margin-bottom: 28px;
-      }
-      #overlay input {
-        background: rgba(255, 255, 255, 0.08);
-        border: 1.5px solid rgba(255, 255, 255, 0.2);
-        color: #fff;
-        font-size: 18px;
-        padding: 10px 20px;
-        border-radius: 8px;
-        outline: none;
-        text-align: center;
-        margin-bottom: 16px;
-        width: 240px;
-      }
-      #overlay input::placeholder {
-        color: #555;
-      }
-      #overlay button {
-        background: #7ef7a0;
-        color: #111;
-        font-size: 18px;
-        font-weight: 700;
-        border: none;
-        padding: 12px 48px;
-        border-radius: 8px;
-        cursor: pointer;
-        letter-spacing: 1px;
-        transition:
-          transform 0.1s,
-          box-shadow 0.1s;
-        box-shadow: 0 4px 24px rgba(126, 247, 160, 0.3);
-      }
-      #overlay button:hover {
-        transform: scale(1.05);
-        box-shadow: 0 6px 32px rgba(126, 247, 160, 0.5);
-      }
-
-      #dead-overlay {
-        position: fixed;
-        inset: 0;
-        background: rgba(10, 10, 20, 0.88);
-        display: none;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        z-index: 100;
-        pointer-events: all;
-      }
-      #dead-overlay h2 {
-        font-size: 48px;
-        font-weight: 900;
-        color: #f97;
-        margin-bottom: 8px;
-      }
-      #dead-overlay p {
-        color: #888;
-        font-size: 15px;
-        margin-bottom: 6px;
-      }
-      #dead-overlay .final-score {
-        font-size: 28px;
-        color: #fff;
-        font-weight: 700;
-        margin-bottom: 24px;
-      }
-      #dead-overlay button {
-        background: #7ef7a0;
-        color: #111;
-        font-size: 16px;
-        font-weight: 700;
-        border: none;
-        padding: 12px 40px;
-        border-radius: 8px;
-        cursor: pointer;
-        letter-spacing: 1px;
-      }
-
-      #hints {
-        position: absolute;
-        bottom: 18px;
-        left: 24px;
-        color: #555;
-        font-size: 12px;
-        line-height: 1.8;
-      }
-    </style>
-  </head>
-  <body>
-    <canvas id="game"></canvas>
-    <div id="ui">
-      <div id="score">Mass: 0</div>
-      <div id="leaderboard">
-        <h3>Leaderboard</h3>
-        <div id="lb-entries"></div>
-      </div>
-      <div id="minimap"><canvas id="mm"></canvas></div>
-      <div id="hints">
-        <b style="color: #777">W</b> — eject mass&nbsp;&nbsp;
-        <b style="color: #777">Space</b> — split
-      </div>
-    </div>
-
-    <div id="overlay">
-      <h1>agar.io</h1>
-      <p>Move your mouse to navigate. Eat smaller cells to grow.</p>
-      <input
-        id="nick"
-        type="text"
-        placeholder="Enter your name"
-        maxlength="16"
-      />
-      <button id="play-btn">PLAY</button>
-    </div>
-
-    <div id="dead-overlay" id="dead-overlay">
-      <h2>You died!</h2>
-      <p>Final score</p>
-      <div class="final-score" id="final-score">0</div>
-      <button id="respawn-btn">Play Again</button>
-    </div>
-
-    <script>
-      // ─── CONFIG ───────────────────────────────────────────────────────────────────
-      const WORLD = 4000;
-      const FOOD_COUNT = 600;
-      const VIRUS_COUNT = 18;
-      const BOT_COUNT = 20;
-      const TICK = 1000 / 60;
-      const MERGE_TIME = 10000; // ms before split cells merge back
-      const DECAY_RATE = 0.0001; // mass lost per tick above threshold
-      const DECAY_THRESHOLD = 200;
-      const EJECT_COST = 18;
-      const EJECT_MASS = 14;
-      const SPLIT_MIN_MASS = 36;
-      const MAX_SPLITS = 16;
-      const VIRUS_SPLIT_MASS = 133;
-
-      // ─── UTILS ────────────────────────────────────────────────────────────────────
-      const rnd = (a, b) => Math.random() * (b - a) + a;
-      const rndInt = (a, b) => Math.floor(rnd(a, b));
-      const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+        function gameLoop() {
+          sendMove();
+          render();
+          requestAnimationFrame(gameLoop);
+        }
+        gameLoop();
+        </script>
+        </body>
+        </html>
       const massToR = (m) => Math.sqrt(m / Math.PI) * 4;
       const rToMass = (r) => Math.PI * (r / 4) ** 2;
       const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
