@@ -16,7 +16,7 @@ Treba dokumentovati sve poruke u oba smera:
 | Smer | Tip | Polja |
 |---|---|---|
 | klijent → server | `join` | `ime` |
-| klijent → server | `move` | `x, y` (world koordinate) |
+| klijent → server | `move` | `dx, dy` (smer kretanja) |
 | klijent → server | `split` | — |
 | klijent → server | `eject` | — |
 | klijent → server | `respawn` | — |
