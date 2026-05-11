@@ -178,6 +178,10 @@
       leaderboard: []
     };
 
+    // NOVO:  foodMap je Map koja se ažurira inkrementalno (add/remove delte)
+    let foodMap = new Map();   // id → {id, x, y, hue, mass}
+    // gameState.viruses ostaje običan array – samo 18 komada
+
     // Za glatku interpolaciju između tikova
     let prevState = null;
     let lastTickTime = 0;
@@ -208,7 +212,8 @@
 
     function connectWS() {
       setStatus('Povezujem se...', 'connecting');
-      ws = new WebSocket('ws://localhost:8765');
+      //ws = new WebSocket('wss://https://web-projekat2.onrender.com');
+      ws = new WebSocket('wss://web-projekat2.onrender.com');
 
       ws.onopen = () => {
         wsConnected = true;
@@ -270,34 +275,49 @@
           // Server nas prepoznao
           break;
 
+        // ZAMENI case 'init':
         case 'init':
-          gameState.myPlayerId = data.player_id;
-          gameState.myHue      = data.hue;
-          gameState.myName     = data.name;
-          gameState.worldSize  = data.world_size || 4000;
-          // Sakrij overlay, pokaži igru
-          document.getElementById('overlay').style.display = 'none';
-          document.getElementById('dead-overlay').style.display = 'none';
-          if (!animId) loop();
-          break;
+            gameState.myPlayerId = data.player_id;
+            gameState.myHue      = data.hue;
+            gameState.myName     = data.name;
+            gameState.worldSize  = data.world_size || 4000;
+            // Populiši foodMap iz snapshot-a (samo jednom, pri join-u)
+            foodMap.clear();
+            if (data.food_snapshot) {
+                for (const f of data.food_snapshot) foodMap.set(f.id, f);
+            }
+            gameState.viruses = data.virus_snapshot || [];
+            document.getElementById('overlay').style.display = 'none';
+            document.getElementById('dead-overlay').style.display = 'none';
+            if (!animId) loop();
+            break;
 
-        case 'tick':
-          // Ovo je srce klijenta – server šalje šta treba prikazati
-          prevState = {
-            cells: gameState.cells,
-            food:  gameState.food,
-            viruses: gameState.viruses
-          };
-          gameState.cells   = data.cells   || [];
-          gameState.food    = data.food    || [];
-          gameState.viruses = data.viruses || [];
-          gameState.myMass  = data.my_mass || 0;
-          const now = performance.now();
-          if (lastTickTime > 0) {
-            tickInterval = now - lastTickTime;
-          }
-          lastTickTime = now;
-          break;
+        // ZAMENI case 'tick':
+        case 'tick': {
+            prevState        = { cells: gameState.cells };
+            gameState.cells   = data.cells   || [];
+            gameState.viruses = data.viruses || [];   // full lista, 18 komada, sitnica
+            gameState.myMass  = data.my_mass || 0;
+
+            // ── Food dirty flags – inkrementalno ažuriranje ──
+            if (data.food_remove) {
+                for (const id of data.food_remove) foodMap.delete(id);
+            }
+            if (data.food_add) {
+                for (const f of data.food_add) foodMap.set(f.id, f);
+            }
+            // ── Ejected food – ažuriraj pozicije (kreću se svaki tik) ──
+            if (data.ejected) {
+                for (const e of data.ejected) {
+                    const f = foodMap.get(e.id);
+                    if (f) { f.x = e.x; f.y = e.y; }
+                }
+            }
+            const now = performance.now();
+            if (lastTickTime > 0) tickInterval = now - lastTickTime;
+            lastTickTime = now;
+            break;
+        }
 
         case 'leaderboard':
           gameState.leaderboard = data.entries || [];
@@ -504,9 +524,10 @@
       mmCtx.fillStyle = '#0a0a14';
       mmCtx.fillRect(0, 0, 130, 130);
 
-      for (const f of gameState.food) {
-        mmCtx.fillStyle = hslStr(f.hue, 70, 55);
-        mmCtx.fillRect(f.x * s - 0.5, f.y * s - 0.5, 1, 1);
+      // NOVO:
+      for (const f of foodMap.values()) {
+          mmCtx.fillStyle = hslStr(f.hue, 70, 55);
+          mmCtx.fillRect(f.x * s - 0.5, f.y * s - 0.5, 1, 1);
       }
 
       for (const c of gameState.cells) {
@@ -556,10 +577,9 @@
       drawGrid(cam);
       drawBorder(cam);
 
-      // Hrana
-      for (const f of gameState.food)    drawFood(f, cam);
-      // Virusi
-      for (const v of gameState.viruses) drawVirus(v, cam);
+      // NOVO:
+      for (const f of foodMap.values())  drawFood(f, cam);   // ← iterišemo Map
+      for (const v of gameState.viruses) drawVirus(v, cam);  // ← ostaje array
 
       // Sortiraj ćelije: tuđe prvo, naše na vrhu (da budu ispred)
       const others = gameState.cells.filter(c => !c.mine);
