@@ -23,8 +23,8 @@ FOOD_COUNT        = 600
 VIRUS_COUNT       = 18
 BOT_COUNT         = 20
 MERGE_TIME        = 10.0        # sekundi pre spajanja split ćelija
-DECAY_THRESHOLD   = 200.0
-DECAY_RATE        = 0.0035      # % gubitka mase po tiku
+DECAY_THRESHOLD   = 100.0
+DECAY_RATE        = 0.0008       # NOVO – agresivniji decay, podstiče aktivnu igru:  masa=1000 gubi ~8/sekundi → od 1000 na 200 za ~3.5 minuta
 EJECT_COST        = 18.0
 EJECT_MASS        = 14.0
 SPLIT_MIN_MASS    = 36.0
@@ -35,6 +35,15 @@ GRID_CELL_SIZE    = 250         # velicina spatial grid celije
 VIEWPORT_W        = 1800.0      # sirma viewporta u world jedinicama
 VIEWPORT_H        = 1400.0
 LEADERBOARD_EVERY = 1.0         # sekundi
+
+# ─── NOVE GAMEPLAY KONSTANTE ────────────────────────────────────────────────
+VIRUS_EAT_MASS_GAIN     = 15.0   # masa dobijena od virusa pre eksplozije
+VIRUS_RESPAWN_MARGIN    = 350.0  # minimalni razmak od igrača pri respawnu virusa
+VIRUS_SPLIT_GAP         = 55.0   # razmak između centra starog i novog virusa
+VIRUS_LAUNCH_SPEED      = 6.0    # brzina novog virusa pri odvajanju
+EJECT_DISTANCE          = 28.0   # udaljenost peleta od ivice ćelije
+EJECT_COOLDOWN_TIME     = 0.6    # sekundi pre nego što ejected peleta može biti pojedena
+SPLIT_LAUNCH_SPEED      = 22.0   # početna brzina splita (world-units/tick)
 
 BOT_NAMES = [
     "Moose","Panda","Rex","Nova","Ace","Zara","Kira","Bolt",
@@ -74,10 +83,15 @@ class Cell:
     def radius(self) -> float:
         return mass_to_radius(self.mass)
 
+    # NOVO:
     @property
     def speed(self) -> float:
-        return 8 / (math.log10(max(self.mass-50, 1.0))+1)
+        # masa=50 → 5.4 u/t (normalnih 324 u/s)
+        # masa=200 → 2.7 u/t (162 u/s)
+        # masa=1000 → 1.2 u/t (72 u/s – i dalje pliva, ne stoji)
+        return max(1.2, 38.0 / math.sqrt(self.mass))
 
+# NOVO – dodajemo cooldown da se peleta ne može odmah pojesti:
 @dataclass
 class FoodPellet:
     id: str
@@ -88,7 +102,9 @@ class FoodPellet:
     vx: float = 0.0
     vy: float = 0.0
     ejected: bool = False
+    eject_cooldown: float = 0.0   # ← dok > 0, ne može biti pojedena
 
+# NOVO – dodajemo vx/vy da virus može biti "ispaljen":
 @dataclass
 class Virus:
     id: str
@@ -96,6 +112,8 @@ class Virus:
     y: float
     mass: float = 100.0
     fed_count: int = 0
+    vx: float = 0.0    # ← brzina za lansiranje pri deljenju
+    vy: float = 0.0
 
     @property
     def radius(self) -> float:
@@ -147,24 +165,39 @@ class GameWorld:
         self._spawn_initial_food()
         self._spawn_viruses()
 
+        # ── Dirty tracking – resetuje se posle svakog tika ──
+        self.food_added_tick:   list = []   # [{id,x,y,hue,mass}, ...]
+        self.food_removed_tick: list = []   # ["id1", "id2", ...]
+        # ── Food grid keš ──
+        self._food_grid:       dict = {}
+        self._food_grid_valid: bool = False
+
+    # NOVO – inicijalna hrana ide u snapshot, ne u dirty listu:
     def _spawn_initial_food(self):
         while len(self.food) < FOOD_COUNT:
-            self._add_food_pellet()
+            self._add_food_pellet(track_dirty=False)
 
+    #NOVO
     def _add_food_pellet(self, x=None, y=None, mass=None, hue=None,
-                          vx=0.0, vy=0.0, ejected=False):
+                      vx=0.0, vy=0.0, ejected=False, track_dirty=True):
         fid = new_id()
         r = random.random()
         if mass is None:
             mass = 1.0 if r < 0.6 else (3.0 if r < 0.9 else 5.0)
-        self.food[fid] = FoodPellet(
+        f = FoodPellet(
             id=fid,
             x=x if x is not None else rnd(20, WORLD_SIZE - 20),
             y=y if y is not None else rnd(20, WORLD_SIZE - 20),
-            mass=mass,
-            hue=hue if hue is not None else random.randint(0, 359),
+            mass=mass, hue=hue if hue is not None else random.randint(0, 359),
             vx=vx, vy=vy, ejected=ejected
         )
+        self.food[fid] = f
+        self._food_grid_valid = False                        # ← invalidate keš uvek
+        if track_dirty:
+            self.food_added_tick.append({                   # ← prati samo kad treba
+                "id": fid, "x": round(f.x, 1), "y": round(f.y, 1),
+                "hue": f.hue, "mass": f.mass
+            })
         return fid
 
     def _spawn_viruses(self):
@@ -207,6 +240,37 @@ class GameWorld:
     def refill_viruses(self):
         while len(self.viruses) < VIRUS_COUNT:
             self._add_virus()
+
+    def get_food_grid(self) -> dict:
+        """Vraća keširani spatial grid. Rebuiluje se SAMO kad je hrana dodana/uklonjena."""
+        if not self._food_grid_valid:
+            grid = {}
+            for fid, f in self.food.items():
+                key = (int(f.x // GRID_CELL_SIZE), int(f.y // GRID_CELL_SIZE))
+                grid.setdefault(key, []).append(fid)
+            self._food_grid = grid
+            self._food_grid_valid = True
+        return self._food_grid
+    
+    def _add_virus_safe(self, players: dict):
+        """
+        Spawns virus na mestu koje nije blizu nijednog igrača.
+        Pokušava do 15 puta pre fallback-a na potpuno random.
+        """
+        for _ in range(15):
+            x = rnd(100, WORLD_SIZE - 100)
+            y = rnd(100, WORLD_SIZE - 100)
+            too_close = False
+            for p in players.values():
+                if p.dead:
+                    continue
+                if dist2(p.cx, p.cy, x, y) < VIRUS_RESPAWN_MARGIN:
+                    too_close = True
+                    break
+            if not too_close:
+                self._add_virus(x, y)
+                return
+        self._add_virus()   # fallback
 
 # ─── SPATIAL GRID ────────────────────────────────────────────────────────────
 def build_food_grid(world: GameWorld) -> dict:
@@ -255,8 +319,11 @@ def update_merge_timer(cell: Cell, dt: float):
         cell.merge_timer = max(0.0, cell.merge_timer - dt)
 
 def update_ejected_food(world: GameWorld, dt: float):
-    to_remove = []
-    for fid, f in world.food.items():
+    for fid, f in list(world.food.items()):
+        # NOVO: dekrementiraj cooldown za SVU hranu (cost je minimalan)
+        if f.eject_cooldown > 0:
+            f.eject_cooldown = max(0.0, f.eject_cooldown - dt)
+
         if not f.ejected:
             continue
         f.x += f.vx
@@ -265,19 +332,46 @@ def update_ejected_food(world: GameWorld, dt: float):
         f.vy *= 0.88
         f.x = clamp(f.x, 0, WORLD_SIZE)
         f.y = clamp(f.y, 0, WORLD_SIZE)
-        # Da li peleta udara u virus
+
         for vid, v in list(world.viruses.items()):
             if dist2(f.x, f.y, v.x, v.y) < v.radius + mass_to_radius(f.mass):
                 f.ejected = False
                 f.mass = 1.0
+                f.eject_cooldown = 0.0
                 v.fed_count += 1
                 if v.fed_count >= VIRUS_FEED_COUNT:
                     v.fed_count = 0
-                    # Virus se deli i ispaljivuje novi
                     if len(world.viruses) < VIRUS_COUNT + 5:
-                        world._add_virus(v.x + rnd(-30, 30), v.y + rnd(-30, 30))
+                        # NOVO: novi virus se lansira u smeru peleta
+                        angle = math.atan2(f.vy, f.vx) if (
+                            abs(f.vx) > 0.01 or abs(f.vy) > 0.01
+                        ) else random.uniform(0, math.pi * 2)
+
+                        gap = v.radius * 2 + VIRUS_SPLIT_GAP
+                        nv_id = new_id()
+                        nv = Virus(
+                            id=nv_id,
+                            x=clamp(v.x + math.cos(angle) * gap, 100, WORLD_SIZE - 100),
+                            y=clamp(v.y + math.sin(angle) * gap, 100, WORLD_SIZE - 100),
+                            vx=math.cos(angle) * VIRUS_LAUNCH_SPEED,
+                            vy=math.sin(angle) * VIRUS_LAUNCH_SPEED
+                        )
+                        world.viruses[nv_id] = nv
                 break
-    return to_remove
+
+def update_viruses(world: GameWorld, dt: float):
+    """Pomera viruse koji su 'ispaljivani' pri deljenju (dok se ne zaustave)."""
+    for v in world.viruses.values():
+        if abs(v.vx) < 0.01 and abs(v.vy) < 0.01:
+            continue   # virus miruje – preskači
+        v.x = clamp(v.x + v.vx, v.radius, WORLD_SIZE - v.radius)
+        v.y = clamp(v.y + v.vy, v.radius, WORLD_SIZE - v.radius)
+        v.vx *= 0.88   # trenje – usporava postepeno
+        v.vy *= 0.88
+        if abs(v.vx) < 0.05:
+            v.vx = 0.0
+        if abs(v.vy) < 0.05:
+            v.vy = 0.0
 
 # ─── MERGE ĆELIJA ────────────────────────────────────────────────────────────
 def try_merge_cells(player: Player):
@@ -299,6 +393,36 @@ def try_merge_cells(player: Player):
                 j += 1
         i += 1
 
+def resolve_self_collision(player: Player):
+    """
+    Razdvaja ćelije istog igrača koje se preklapaju.
+    Aktivno dok bar jedna ćelija ima merge_timer > 0.
+    Kad obe stignu na 0, try_merge_cells ih spaja.
+    """
+    cells = player.cells
+    n = len(cells)
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = cells[i], cells[j]
+            # Preskočimo par koji je spreman za spajanje – neka se prekriju
+            if a.merge_timer <= 0.0 and b.merge_timer <= 0.0:
+                continue
+            dx = b.x - a.x
+            dy = b.y - a.y
+            d  = math.hypot(dx, dy)
+            min_dist = a.radius + b.radius
+            if d >= min_dist:
+                continue       # nema preklapanja
+            if d < 1e-6:       # isti centar (edge case – npr. odmah posle splita)
+                nx, ny = 1.0, 0.0
+            else:
+                nx, ny = dx / d, dy / d
+            push = (min_dist - d) * 0.5   # svaka se pomera za pola preklapanja
+            a.x = clamp(a.x - nx * push, a.radius, WORLD_SIZE - a.radius)
+            a.y = clamp(a.y - ny * push, a.radius, WORLD_SIZE - a.radius)
+            b.x = clamp(b.x + nx * push, b.radius, WORLD_SIZE - b.radius)
+            b.y = clamp(b.y + ny * push, b.radius, WORLD_SIZE - b.radius)
+
 # ─── SPLIT ───────────────────────────────────────────────────────────────────
 def do_split(player: Player):
     if len(player.cells) >= MAX_SPLITS:
@@ -309,6 +433,7 @@ def do_split(player: Player):
             continue
         if len(player.cells) + len(new_cells) >= MAX_SPLITS:
             break
+
         dx = player.target_x - cell.x
         dy = player.target_y - cell.y
         d = math.hypot(dx, dy) or 1.0
@@ -316,11 +441,17 @@ def do_split(player: Player):
         cell.mass = half
         child = Cell(id=new_id(), owner_id=player.player_id,
                      x=cell.x, y=cell.y, mass=half)
-        child.vx = (dx / d) * child.speed * 12.0
-        child.vy = (dy / d) * child.speed * 12.0
-        child.merge_timer = MERGE_TIME
-        cell.merge_timer = MERGE_TIME
+
+        # NOVO: fiksna lansirna brzina – ne zavisi od mase
+        # Ćelija se "ispali" kao projektil, zatim usporava prirodno
+        child.vx = (dx / d) * SPLIT_LAUNCH_SPEED
+        child.vy = (dy / d) * SPLIT_LAUNCH_SPEED
+
+        merge_t = MERGE_TIME + half * 0.015
+        child.merge_timer = merge_t
+        cell.merge_timer  = merge_t
         new_cells.append(child)
+
     player.cells.extend(new_cells)
 
 # ─── EJECT ───────────────────────────────────────────────────────────────────
@@ -332,15 +463,22 @@ def do_eject(player: Player, world: GameWorld):
         dy = player.target_y - cell.y
         d = math.hypot(dx, dy) or 1.0
         cell.mass -= EJECT_COST
-        ex = cell.x + (dx / d) * (cell.radius + 5)
-        ey = cell.y + (dy / d) * (cell.radius + 5)
-        world._add_food_pellet(
+        
+        # NOVO: EJECT_DISTANCE umesto hardkodovanih 5px
+        ex = cell.x + (dx / d) * (cell.radius + EJECT_DISTANCE)
+        ey = cell.y + (dy / d) * (cell.radius + EJECT_DISTANCE)
+        
+        fid = world._add_food_pellet(
             x=ex, y=ey, mass=EJECT_MASS,
             hue=player.hue,
-            vx=(dx / d) * 9.0,
-            vy=(dy / d) * 9.0,
+            vx=(dx / d) * 10.0,
+            vy=(dy / d) * 10.0,
             ejected=True
         )
+        # NOVO: postavi cooldown da se peleta ne može odmah pojesti
+        # (sprečava bug gde ćelija pojede svoju sopstvenu peletu)
+        if fid in world.food:
+            world.food[fid].eject_cooldown = EJECT_COOLDOWN_TIME
 
 # ─── VIRUS POP ───────────────────────────────────────────────────────────────
 def pop_cell(cell: Cell, player: Player):
@@ -363,10 +501,11 @@ def pop_cell(cell: Cell, player: Player):
 
 # ─── KOLIZIJE ────────────────────────────────────────────────────────────────
 def resolve_collisions(world: GameWorld):
-    food_grid = build_food_grid(world)
-    eaten_food = set()
-    dead_cells = set()
+    food_grid = world.get_food_grid()
+    eaten_food  = set()
+    dead_cells  = set()
     dead_players = set()
+    viruses_eaten = []   # ← NOVO: lista (virus_id, cell) parova
 
     all_players = list(world.players.values())
 
@@ -374,33 +513,52 @@ def resolve_collisions(world: GameWorld):
         if player.dead:
             continue
         for cell in player.cells:
-            # Jedenje hrane
+
+            # ── Jedenje hrane ──
             for fid in nearby_food_ids(food_grid, cell.x, cell.y, cell.radius + 10):
                 if fid in eaten_food:
                     continue
                 f = world.food.get(fid)
                 if f is None:
                     continue
+                # NOVO: preskoči hranu koja je još u cooldown-u
+                if f.eject_cooldown > 0:
+                    continue
                 if dist2(cell.x, cell.y, f.x, f.y) < cell.radius:
                     cell.mass += f.mass
                     eaten_food.add(fid)
 
-            # Interakcija sa virusima
+            # ── Interakcija sa virusima – NOVO ──
             for vid, v in list(world.viruses.items()):
                 if cell.mass > VIRUS_SPLIT_MASS:
                     if dist2(cell.x, cell.y, v.x, v.y) < cell.radius:
-                        if not player.is_bot:
-                            if len(player.cells) < MAX_SPLITS:
-                                pop_cell(cell, player)
-                        else:
-                            cell.mass *= 0.7
+                        viruses_eaten.append((vid, cell, player))
                         break
 
-    # Brisanje pojedene hrane
+    # ── Brisanje hrane ──
     for fid in eaten_food:
         world.food.pop(fid, None)
+        world.food_removed_tick.append(fid)
+    world._food_grid_valid = False
 
-    # Igrač jede igrača
+    # ── NOVO: Obrada pojedenih virusa ──
+    for vid, cell, player in viruses_eaten:
+        if vid not in world.viruses:
+            continue   # već obrađen u ovom tiku
+        # 1. Ukloni virus
+        world.viruses.pop(vid)
+        # 2. Daj masu igraču PRVO
+        cell.mass += VIRUS_EAT_MASS_GAIN
+        # 3. Zatim eksploduj ćeliju
+        if not player.is_bot:
+            if len(player.cells) < MAX_SPLITS:
+                pop_cell(cell, player)
+        else:
+            cell.mass *= 0.7   # botovi samo gube masu, ne eksploduju
+        # 4. Respawn virusa na random mestu, dalje od svih igrača
+        world._add_virus_safe(world.players)
+
+    # ── Igrač jede igrača ──
     for i, pred_player in enumerate(all_players):
         if pred_player.dead:
             continue
@@ -411,7 +569,8 @@ def resolve_collisions(world: GameWorld):
                 for k in range(len(prey_player.cells) - 1, -1, -1):
                     prey_cell = prey_player.cells[k]
                     if pred_cell.mass > prey_cell.mass * 1.15:
-                        d = dist2(pred_cell.x, pred_cell.y, prey_cell.x, prey_cell.y)
+                        d = dist2(pred_cell.x, pred_cell.y,
+                                  prey_cell.x, prey_cell.y)
                         if d < pred_cell.radius - prey_cell.radius * 0.3:
                             pred_cell.mass += prey_cell.mass
                             dead_cells.add(prey_cell.id)
@@ -494,7 +653,6 @@ def build_tick_payload(world: GameWorld, player: Player) -> dict:
         if p.dead:
             continue
         for c in p.cells:
-            # Uvek uključi sopstvene ćelije
             if p.player_id == player.player_id:
                 cells_out.append({
                     "id": c.id, "pid": p.player_id,
@@ -502,8 +660,7 @@ def build_tick_payload(world: GameWorld, player: Player) -> dict:
                     "x": round(c.x, 1), "y": round(c.y, 1),
                     "mass": round(c.mass, 1), "mine": True
                 })
-            elif (min_x - 100 < c.x < max_x + 100 and
-                  min_y - 100 < c.y < max_y + 100):
+            elif min_x - 100 < c.x < max_x + 100 and min_y - 100 < c.y < max_y + 100:
                 cells_out.append({
                     "id": c.id, "pid": p.player_id,
                     "name": p.name, "hue": p.hue,
@@ -511,30 +668,28 @@ def build_tick_payload(world: GameWorld, player: Player) -> dict:
                     "mass": round(c.mass, 1), "mine": False
                 })
 
-    food_out = []
-    for f in world.food.values():
-        if min_x < f.x < max_x and min_y < f.y < max_y:
-            food_out.append({
-                "id": f.id,
-                "x": round(f.x, 1), "y": round(f.y, 1),
-                "hue": f.hue, "mass": f.mass
-            })
+    # Virusi – šaljemo SVE (samo 18, ~720B, trivijalno)
+    viruses_out = [
+        {"id": v.id, "x": round(v.x, 1), "y": round(v.y, 1)}
+        for v in world.viruses.values()
+    ]
 
-    viruses_out = []
-    for v in world.viruses.values():
-        if min_x < v.x < max_x and min_y < v.y < max_y:
-            viruses_out.append({
-                "id": v.id,
-                "x": round(v.x, 1), "y": round(v.y, 1)
-            })
+    # Ejected food prati se POSEBNO jer se POMERA svaki tik
+    # (obična hrana ne može da se prati dirty-jem jer ne zna gde je)
+    ejected_out = [
+        {"id": f.id, "x": round(f.x, 1), "y": round(f.y, 1), "hue": f.hue}
+        for f in world.food.values() if f.ejected
+    ]
 
     return {
-        "type": "tick",
-        "t": round(time.monotonic(), 3),
-        "cells": cells_out,
-        "food": food_out,
-        "viruses": viruses_out,
-        "my_mass": round(player.total_mass, 0)
+        "type":        "tick",
+        "t":           round(time.monotonic(), 3),
+        "cells":       cells_out,
+        "viruses":     viruses_out,
+        "food_add":    world.food_added_tick,     # ← globalni dirty, isti za sve
+        "food_remove": world.food_removed_tick,   # ← globalni dirty, isti za sve
+        "ejected":     ejected_out,               # ← pozicije ispaljenih peleta
+        "my_mass":     round(player.total_mass, 0)
     }
 
 def build_leaderboard(world: GameWorld) -> list:
@@ -601,84 +756,92 @@ async def game_loop():
 
     print(f"[Game] Loop pokrenut @ {TICK_RATE} TPS")
 
+    # ZAMENI ceo while True blok:
     while True:
         loop_start = time.monotonic()
-        dt = loop_start - last_time
+
+        # ── CAP: dt ne sme biti veći od 100ms da fizika ne eksplodira ──
+        raw_dt = loop_start - last_time
+        dt = min(raw_dt, 0.1)
         last_time = loop_start
 
-        # ── 1. Primeni inpute i fiziku igrača ──
-        for player in list(world.players.values()):
-            if player.dead:
-                continue
+        try:
+            # ── 1. Primeni inpute i fiziku igrača ──
+            for player in list(world.players.values()):
+                if player.dead:
+                    continue
+                if player.is_bot:
+                    update_bot_ai(player, world, dt)
+                if player.wants_split:
+                    do_split(player)
+                    player.wants_split = False
+                if player.wants_eject:
+                    do_eject(player, world)
+                    player.wants_eject = False
+                for cell in player.cells:
+                    move_cell(cell, player.target_x, player.target_y, dt)
+                    apply_decay(cell, dt)
+                    update_merge_timer(cell, dt)
+                if len(player.cells) > 1:
+                    try_merge_cells(player)
+                    resolve_self_collision(player)
 
-            # Bot AI
-            if player.is_bot:
-                update_bot_ai(player, world, dt)
+            # ── 2. Ejected food + virusi u pokretu ──
+            update_ejected_food(world, dt)
+            update_viruses(world, dt)          # ← NOVO (objašnjeno u Task 3)
 
-            # Split i eject
-            if player.wants_split:
-                do_split(player)
-                player.wants_split = False
-            if player.wants_eject:
-                do_eject(player, world)
-                player.wants_eject = False
+            # ── 3. Kolizije ──
+            dead_players, dead_cells = resolve_collisions(world)
 
-            # Pomeri ćelije
-            for cell in player.cells:
-                move_cell(cell, player.target_x, player.target_y, dt)
-                apply_decay(cell, dt)
-                update_merge_timer(cell, dt)
+            # ── 4. Obradi mrtve igrače ──
+            for pid in dead_players:
+                player = world.players.get(pid)
+                if player is None:
+                    continue
+                player.dead = True
+                if not player.is_bot:
+                    session = next(
+                        (s for s in sessions.values() if s.player_id == pid), None
+                    )
+                    if session:
+                        await safe_send(session.websocket, {
+                            "type": "died",
+                            "final_mass": int(player.total_mass)
+                        })
+                world.remove_player(pid)
 
-            # Spoji ćelije ako je moguće
-            if len(player.cells) > 1:
-                try_merge_cells(player)
-
-        # ── 2. Ejected food fizika ──
-        update_ejected_food(world, dt)
-
-        # ── 3. Kolizije ──
-        dead_players, dead_cells = resolve_collisions(world)
-
-        # ── 4. Obradi mrtve igrače ──
-        for pid in dead_players:
-            player = world.players.get(pid)
-            if player is None:
-                continue
-            player.dead = True
-            if not player.is_bot:
-                # Obavesti klijenta
-                session = next(
-                    (s for s in sessions.values() if s.player_id == pid), None
-                )
-                if session:
-                    await safe_send(session.websocket, {
-                        "type": "died",
-                        "final_mass": int(player.total_mass)
-                    })
-            world.remove_player(pid)
-
-        # ── 5. Respawn botova ──
-        bots = [p for p in world.players.values() if p.is_bot and not p.dead]
-        while len(bots) < BOT_COUNT:
-            name = random.choice(BOT_NAMES)
-            world.add_player(session_id=f"bot_{new_id()}", name=name, is_bot=True)
+            # ── 5. Respawn botova ──
             bots = [p for p in world.players.values() if p.is_bot and not p.dead]
+            while len(bots) < BOT_COUNT:
+                name = random.choice(BOT_NAMES)
+                world.add_player(session_id=f"bot_{new_id()}", name=name, is_bot=True)
+                bots = [p for p in world.players.values() if p.is_bot and not p.dead]
 
-        # ── 6. Dopuni hranu i viruse ──
-        world.refill_food()
-        world.refill_viruses()
+            # ── 6. Dopuni hranu i viruse ──
+            world.refill_food()
+            world.refill_viruses()
 
-        # ── 7. Broadcast tick ──
-        await broadcast_ticks()
+            # ── 7. Broadcast tick ──
+            await broadcast_ticks()
+            world.food_added_tick.clear()
+            world.food_removed_tick.clear()
 
-        # ── 8. Leaderboard svakih ~1s ──
-        lb_counter += 1
-        if time.monotonic() - last_leaderboard >= LEADERBOARD_EVERY:
-            await broadcast_leaderboard()
-            last_leaderboard = time.monotonic()
+            # ── 8. Leaderboard ──
+            if time.monotonic() - last_leaderboard >= LEADERBOARD_EVERY:
+                await broadcast_leaderboard()
+                last_leaderboard = time.monotonic()
 
-        # ── Precizno čekanje do sledećeg tika ──
+        except Exception as e:
+            # ← KLJUČNI FIX: jedan loš tik ne ubija ceo server
+            import traceback
+            print(f"[!] Greška u game tiku (preskačem): {type(e).__name__}: {e}")
+            traceback.print_exc()
+
+        # ── sleep je UVEK van try/except ──
         elapsed = time.monotonic() - loop_start
+        # Dodatna zaštita od NaN/Inf
+        if not math.isfinite(elapsed) or elapsed < 0:
+            elapsed = 0.0
         sleep_for = max(0.0, TICK_DELTA - elapsed)
         await asyncio.sleep(sleep_for)
 
@@ -736,12 +899,24 @@ async def handle_client(websocket):
                         player_id = player.player_id
                         session.player_id = player_id
                     p = world.players[player_id]
+                    # NOVO. Snapshot svih food peleta – šalje se JEDNOM pri join-u
+                    food_snapshot = [
+                        {"id": f.id, "x": round(f.x, 1), "y": round(f.y, 1),
+                        "hue": f.hue, "mass": f.mass}
+                        for f in world.food.values()
+                    ]
+                    virus_snapshot = [
+                        {"id": v.id, "x": round(v.x, 1), "y": round(v.y, 1)}
+                        for v in world.viruses.values()
+                    ]
                     await safe_send(websocket, {
-                        "type": "init",
-                        "player_id": player_id,
-                        "hue": p.hue,
-                        "name": p.name,
-                        "world_size": WORLD_SIZE
+                        "type":           "init",
+                        "player_id":      player_id,
+                        "hue":            p.hue,
+                        "name":           p.name,
+                        "world_size":     WORLD_SIZE,
+                        "food_snapshot":  food_snapshot,    # ← jednom, posle toga samo delte
+                        "virus_snapshot": virus_snapshot
                     })
                     print(f"  [{session_id[:8]}] Ušao kao '{p.name}'")
 
@@ -763,13 +938,28 @@ async def handle_client(websocket):
                     player_id = player.player_id
                     session.player_id = player_id
                     p = world.players[player_id]
+                    # Snapshot svih food peleta – šalje se JEDNOM pri join-u
+                    food_snapshot = [
+                        {"id": f.id, "x": round(f.x, 1), "y": round(f.y, 1),
+                        "hue": f.hue, "mass": f.mass}
+                        for f in world.food.values()
+                    ]
+                    virus_snapshot = [
+                        {"id": v.id, "x": round(v.x, 1), "y": round(v.y, 1)}
+                        for v in world.viruses.values()
+                    ]
                     await safe_send(websocket, {
-                        "type": "init",
-                        "player_id": player_id,
-                        "hue": p.hue,
-                        "name": p.name,
-                        "world_size": WORLD_SIZE
+                        "type":           "init",
+                        "player_id":      player_id,
+                        "hue":            p.hue,
+                        "name":           p.name,
+                        "world_size":     WORLD_SIZE,
+                        "food_snapshot":  food_snapshot,    # ← jednom, posle toga samo delte
+                        "virus_snapshot": virus_snapshot
                     })
+                # Dodati kao novi elif blok (posle 'respawn' handlera):
+                elif msg_type == "ping":
+                    await safe_send(websocket, {"type": "pong"})
 
             except (json.JSONDecodeError, KeyError, ValueError) as e:
                 pass
@@ -800,7 +990,7 @@ async def main():
     print("=" * 50)
 
     # Pokreni game loop i websocket server paralelno
-    async with websockets.serve(handle_client, "localhost", 8765):
+    async with websockets.serve(handle_client, "0.0.0.0", 8765):
         await game_loop()
 
 if __name__ == "__main__":
