@@ -10,18 +10,29 @@
     <button onclick="disconnect()">Odspoji se</button>
     <input id="msg" placeholder="Poruka..." />
     <button onclick="sendMsg()">Pošalji</button>
-    <pre id="log"></pre>
+    
+    <pre id="log" style="background: #111; color: #fff; padding: 10px; min-height: 150px; max-height: 400px; overflow-y: auto; font-family: monospace; border-radius: 4px; border: 1px solid #333; margin-top: 10px;"></pre>
 
     <script>
       let ws = null;
-      // Generate or get session_id for this tab
+      let localFood = []; // Ovde čuvamo hranu koja stigne sa servera
+
+      // Generisanje ili preuzimanje jedinstvenog session_id za ovaj tab
       if (!sessionStorage.session_id) {
         sessionStorage.session_id = Math.random().toString(36).substr(2, 12);
       }
       const session_id = sessionStorage.session_id;
 
+      // Funkcija za ispis poruka koja sigurno radi i ne blokira dugmiće
       function log(msg) {
-        document.getElementById("log").textContent += msg + "\n";
+        const logElement = document.getElementById("log");
+        if (logElement) {
+          logElement.textContent += msg + "\n";
+          logElement.scrollTop = logElement.scrollHeight; // Automatski skrol na dno
+        } else {
+          // Ako ne postoji element sa id="log", ispisuje u F12 konzolu
+          console.log("LOG: " + msg);
+        }
       }
 
       function connect() {
@@ -29,45 +40,83 @@
           log("Već ste povezani.");
           return;
         }
+        
+        log("Pokušavam povezivanje na ws://localhost:8765...");
         ws = new WebSocket("ws://localhost:8765");
 
         ws.onopen = () => {
           log("Konekcija uspostavljena.");
           ws.send(JSON.stringify({ type: "hello", session_id }));
         };
+
         ws.onmessage = (e) => {
           try {
             const data = JSON.parse(e.data);
+            
             if (data.type === "welcome") {
               log("Dobrodošli! Vaš session_id: " + data.session_id);
-            } else if (data.type === "msg") {
+            } 
+            else if (data.type === "state") {
+              // Hvatanje hrane iz trenutne strukture tvog servera (data.state.food)
+              if (data.state && data.state.food) {
+                localFood = data.state.food;
+                
+                // Ispisujemo uspeh samo jednom pri prvoj poruci da ne zagušimo ekran
+                if (!window.foodLogged) {
+                  log(`Uspelo! Primljeno ${localFood.length} komada hrane sa servera unutar 'state' paketa.`);
+                  console.log("Podaci o hrani unutar konzole:", localFood); // Detaljan uvid u F12 -> Console
+                  window.foodLogged = true;
+                }
+              }
+            } 
+            else if (data.type === "msg") {
               log(`[${data.from}] ${data.text}`);
-            } else if (data.type === "error") {
-              log("Greška: " + data.msg);
-            } else {
-              log("Primljeno: " + e.data);
+            } 
+            else if (data.type === "error") {
+              log("Greška sa servera: " + data.msg);
+            } 
+            else {
+              log("Primljena nepoznata poruka: " + e.data);
             }
-          } catch {
-            log("Primljeno: " + e.data);
+          } catch (err) {
+            log("Greška pri parsiranju JSON-a.");
           }
         };
-        ws.onclose = () => log("Konekcija zatvorena.");
-        ws.onerror = () => log("Greška.");
+
+        ws.onclose = () => {
+          log("Konekcija zatvorena.");
+          ws = null;
+          window.foodLogged = false; // Resetujemo zastavicu za sledeće povezivanje
+        };
+
+        ws.onerror = (error) => {
+          log("Greška u WebSocket konekciji.");
+          console.error("WS Error:", error);
+        };
       }
 
       function disconnect() {
-        if (ws) ws.close();
+        if (ws) {
+          ws.close();
+          log("Zahtevano odspajanje...");
+        } else {
+          log("Niste ni povezani.");
+        }
       }
 
       function sendMsg() {
         const input = document.getElementById("msg");
+        if (!input) return;
+        
         const text = input.value.trim();
         if (ws && ws.readyState === 1 && text) {
           ws.send(JSON.stringify({ type: "msg", text }));
           input.value = "";
+          log(`[Vi]: ${text}`);
+        } else if (!ws || ws.readyState !== 1) {
+          log("Nemoguće poslati poruku. Niste povezani na server.");
         }
       }
     </script>
   </body>
 </html>
-s

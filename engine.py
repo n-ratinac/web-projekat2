@@ -1,16 +1,18 @@
+# engine.py
 from config import WORLD_WIDTH, WORLD_HEIGHT
 import random
 from player import Player
 from food import Food
+
 class Engine:
     def __init__(self, width=WORLD_WIDTH, height=WORLD_HEIGHT):
         self.width = width
         self.height = height
         self.players = {}  # session_id -> player data
-        self.food = self.init_food(60)
-    
-    def init_food(self,i):
-        return [Food() for x in range (i) ]
+        self.food = self.init_food(600)
+
+    def init_food(self, i):
+        return [Food() for x in range(i)]
 
     def add_player(self, session_id):
         self.players[session_id] = Player(x=random.randint(0, self.width), y=random.randint(0, self.height))
@@ -24,6 +26,8 @@ class Engine:
             player = self.players[session_id]
             player.move(dx, dy)
 
-
     def get_state(self):
-        return {"players": {sid: p.to_dict() for sid, p in self.players.items()}}
+        return {
+            "players": {sid: p.to_dict() for sid, p in self.players.items()},
+            "food": [f.to_dict() for f in self.food]
+        }

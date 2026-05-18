@@ -5,106 +5,69 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Agar.io MVP</title>
     <style>
-      * {
-        margin: 0;
-        padding: 0;
-        box-sizing: border-box;
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body { background: #111; overflow: hidden; font-family: "Segoe UI", sans-serif; }
+      canvas { display: block; }
+      #mm { position: fixed; bottom: 12px; right: 12px; border: 1px solid #333; border-radius: 4px; }
+      #hud { position: fixed; top: 12px; left: 12px; color: #eee; font-size: 14px; }
+      #score { margin-bottom: 4px; }
+      #leaderboard { background: rgba(0,0,0,0.5); padding: 8px 12px; border-radius: 6px; min-width: 140px; }
+      #leaderboard h3 { font-size: 12px; color: #aaa; margin-bottom: 6px; text-transform: uppercase; }
+      .entry { font-size: 12px; padding: 2px 0; color: #ccc; }
+      .entry.me { color: #4f8; font-weight: bold; }
+      #overlay, #dead-overlay {
+        position: fixed; inset: 0; background: rgba(0,0,0,0.75);
+        display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px;
+        color: #fff;
       }
-      body {
-        background: #111;
-        overflow: hidden;
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-          <meta charset="UTF-8">
-          <title>Agar.io Multiplayer Demo</title>
-          <style>
-            html, body { height: 100%; margin: 0; overflow: hidden; }
-            body { background: #222; }
-            canvas { display: block; margin: 0 auto; background: #fff; border: 2px solid #333; }
-          </style>
-        </head>
-        <body>
-        <canvas id="game" width="800" height="600"></canvas>
-        <script>
-        const canvas = document.getElementById('game');
-        const ctx = canvas.getContext('2d');
-        const WORLD_WIDTH = 800;
-        const WORLD_HEIGHT = 600;
-        let session_id = Math.random().toString(36).substr(2, 9);
-        let ws;
-        let myId = session_id;
-        let state = { players: {} };
-        let mouse = { x: WORLD_WIDTH/2, y: WORLD_HEIGHT/2 };
-
-        function connect() {
-          ws = new WebSocket('ws://localhost:8765');
-          ws.onopen = () => {
-            ws.send(JSON.stringify({type: 'hello', session_id: myId}));
-          };
-          ws.onmessage = (ev) => {
-            let msg = JSON.parse(ev.data);
-            if (msg.type === 'welcome') {
-              // ok
-            } else if (msg.type === 'state') {
-              state = msg.state;
-            } else if (msg.type === 'error') {
-              alert(msg.msg);
-            }
-          };
-          ws.onclose = () => {
-            setTimeout(connect, 1000);
-          };
-        }
-        connect();
-
-        canvas.addEventListener('mousemove', e => {
-          const rect = canvas.getBoundingClientRect();
-          mouse.x = e.clientX - rect.left;
-          mouse.y = e.clientY - rect.top;
-        });
-
-        function sendMove() {
-          if (!state.players[myId]) return;
-          const me = state.players[myId];
-          const dx = mouse.x - me.x;
-          const dy = mouse.y - me.y;
-          const len = Math.sqrt(dx*dx + dy*dy);
-          let vx = 0, vy = 0;
-          if (len > 1) {
-            vx = dx / len;
-            vy = dy / len;
-          }
-          if (ws && ws.readyState === 1) {
-            ws.send(JSON.stringify({type: 'move', dx: vx, dy: vy}));
-          }
-        }
-
-        function render() {
-          ctx.clearRect(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
-          // Draw all players
-          for (const [sid, p] of Object.entries(state.players)) {
-            ctx.beginPath();
-            ctx.arc(p.x, p.y, sid === myId ? 20 : 15, 0, 2*Math.PI);
-            ctx.fillStyle = sid === myId ? '#4af' : '#aaa';
-            ctx.fill();
-            ctx.strokeStyle = '#222';
-            ctx.stroke();
-            ctx.font = '12px Arial';
-            ctx.fillStyle = '#222';
-            ctx.fillText(sid === myId ? 'You' : sid, p.x-15, p.y-20);
-          }
-        }
-
-        function gameLoop() {
-          sendMove();
-          render();
-          requestAnimationFrame(gameLoop);
-        }
-        gameLoop();
-        </script>
-        </body>
-        </html>
+      #dead-overlay { display: none; }
+      #overlay h1, #dead-overlay h1 { font-size: 2.5rem; }
+      #nick { padding: 10px 18px; font-size: 1.1rem; border-radius: 8px; border: none; outline: none; width: 240px; }
+      #play-btn, #respawn-btn {
+        padding: 10px 32px; font-size: 1.1rem; border-radius: 8px; border: none;
+        background: #4a9eff; color: #fff; cursor: pointer; font-weight: bold;
+      }
+      #play-btn:hover, #respawn-btn:hover { background: #2277dd; }
+      #dead-overlay p { font-size: 1.1rem; color: #faa; }
+    </style>
+  </head>
+  <body>
+    <canvas id="game"></canvas>
+    <canvas id="mm" width="130" height="130"></canvas>
+    <div id="hud">
+      <div id="score">Mass: 0</div>
+      <div id="leaderboard">
+        <h3>Leaderboard</h3>
+        <div id="lb-entries"></div>
+      </div>
+    </div>
+    <div id="overlay">
+      <h1>&#127823; Agar.io</h1>
+      <input id="nick" type="text" placeholder="Enter your name" maxlength="20" />
+      <button id="play-btn">Play</button>
+      <p style="font-size:0.85rem;color:#888">Move: mouse &nbsp;|&nbsp; Split: Space &nbsp;|&nbsp; Eject: W</p>
+    </div>
+    <div id="dead-overlay">
+      <h1>&#128128; You died!</h1>
+      <p>Score: <span id="final-score">0</span></p>
+      <button id="respawn-btn">Play Again</button>
+    </div>
+    <script>
+      const WORLD = 3000;
+      const FOOD_COUNT = 600;
+      const BOT_COUNT = 15;
+      const VIRUS_COUNT = 18;
+      const DECAY_THRESHOLD = 50;
+      const DECAY_RATE = 0.0004;
+      const MERGE_TIME = 8000;
+      const SPLIT_MIN_MASS = 36;
+      const MAX_SPLITS = 16;
+      const EJECT_COST = 18;
+      const EJECT_MASS = 14;
+      const VIRUS_SPLIT_MASS = 133;
+      const rnd = (a, b) => Math.random() * (b - a) + a;
+      const rndInt = (a, b) => Math.floor(rnd(a, b));
+      const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
       const massToR = (m) => Math.sqrt(m / Math.PI) * 4;
       const rToMass = (r) => Math.PI * (r / 4) ** 2;
       const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -503,6 +466,7 @@
       }
 
       function drawCell(c, cam, alpha = 1) {
+        if (!c.r || !isFinite(c.r) || c.r <= 0) return;
         const [sx, sy] = worldToScreen(c.x, c.y, cam);
         const sr = c.r * cam.zoom;
         if (
@@ -666,12 +630,13 @@
       // ─── COLLISION ────────────────────────────────────────────────────────────────
 
       function eatFood(cells) {
+        const activeFood = serverFood ?? food;
         for (const c of cells) {
-          for (let i = food.length - 1; i >= 0; i--) {
-            const f = food[i];
+          for (let i = activeFood.length - 1; i >= 0; i--) {
+            const f = activeFood[i];
             if (dist(c, f) < c.r) {
               c.mass += f.mass;
-              food.splice(i, 1);
+              activeFood.splice(i, 1);
             }
           }
         }
@@ -869,6 +834,41 @@
 
       // ─── GAME LOOP ────────────────────────────────────────────────────────────────
 
+      // ─── WEBSOCKET ───────────────────────────────────────────────────────────────
+      let ws = null;
+      let serverFood = null;
+
+      function connectWS(sessionId) {
+        try {
+          ws = new WebSocket("ws://localhost:8765");
+          ws.onopen = () => {
+            console.log("[WS] Povezan na server");
+            ws.send(JSON.stringify({ type: "hello", session_id: sessionId }));
+          };
+          ws.onmessage = (e) => {
+            const msg = JSON.parse(e.data);
+            if (msg.type === "state" && msg.state.food) {
+              serverFood = msg.state.food.map(f => ({
+                x: f.x, y: f.y,
+                hue: f.hue,
+                mass: f.value,
+                r: Math.sqrt(f.value / Math.PI) * 4
+              }));
+            }
+          };
+          ws.onclose = () => {
+            console.log("[WS] Veza zatvorena, koristimo lokalnu hranu");
+            serverFood = null;
+          };
+          ws.onerror = () => {
+            console.log("[WS] Server nije dostupan, koristimo lokalnu hranu");
+            serverFood = null;
+          };
+        } catch(err) {
+          serverFood = null;
+        }
+      }
+
       function startGame(name) {
         playerName = name || "Player";
         food = [];
@@ -880,6 +880,8 @@
         running = true;
         lastTick = performance.now();
         if (animId) cancelAnimationFrame(animId);
+        const sessionId = Math.random().toString(36).substr(2, 12);
+        connectWS(sessionId);
         loop();
       }
 
@@ -918,7 +920,7 @@
         drawGrid(cam);
         drawBorder(cam);
 
-        for (const f of food) drawFood(f, cam);
+        for (const f of (serverFood ?? food)) drawFood(f, cam);
         for (const v of viruses) drawVirus(v, cam);
         for (const b of bots) {
           if (!b.dead) for (const c of b.cells) drawCell(c, cam);
@@ -957,6 +959,7 @@
         document.getElementById("dead-overlay").style.display = "none";
         startGame(playerName);
       });
+
     </script>
   </body>
 </html>

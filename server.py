@@ -1,4 +1,3 @@
-
 import asyncio
 import websockets
 import json
@@ -38,7 +37,6 @@ async def handle_client(websocket):
             try:
                 data = json.loads(message)
                 if data.get("type") == "move" and "dx" in data and "dy" in data:
-                    # Pamti poslednju komandu
                     move_commands[session_id] = (data["dx"], data["dy"])
             except Exception as e:
                 print(f"[!] Error handling message: {e}")
@@ -50,26 +48,25 @@ async def handle_client(websocket):
             engine.remove_player(session_id)
             if session_id in move_commands:
                 del move_commands[session_id]
-            print(f"[-] Klijent {session_id} se odspojio. Ukupno: {len(clients)})")
+            print(f"[-] Klijent {session_id} se odspojio. Ukupno: {len(clients)}")
 
 async def tick_loop():
     while True:
         # Obrada svih komandi
-        for session_id, (dx, dy) in move_commands.items():
+        for session_id, (dx, dy) in list(move_commands.items()):
             engine.move_player(session_id, dx, dy)
-        # Resetuj komande (ili ostavi poslednju)
-        # move_commands.clear()  # Ako želiš da se šalje svaki tick
         # Šalji stanje svim klijentima
         state = engine.get_state()
         msg = json.dumps({"type": "state", "state": state})
         to_remove = []
-        for sid, ws in clients.items():
+        for sid, ws in list(clients.items()):
             try:
                 await ws.send(msg)
             except Exception:
                 to_remove.append(sid)
         for sid in to_remove:
-            del clients[sid]
+            if sid in clients:
+                del clients[sid]
             engine.remove_player(sid)
             if sid in move_commands:
                 del move_commands[sid]
