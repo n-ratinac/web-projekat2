@@ -212,8 +212,7 @@
 
     function connectWS() {
       setStatus('Povezujem se...', 'connecting');
-      //ws = new WebSocket('wss://https://web-projekat2.onrender.com');
-      ws = new WebSocket('wss://web-projekat2.onrender.com');
+      ws = new WebSocket('ws://localhost:8765');
 
       ws.onopen = () => {
         wsConnected = true;
@@ -300,11 +299,11 @@
             gameState.myMass  = data.my_mass || 0;
 
             // ── Food dirty flags – inkrementalno ažuriranje ──
-            if (data.food_remove) {
-                for (const id of data.food_remove) foodMap.delete(id);
-            }
             if (data.food_add) {
                 for (const f of data.food_add) foodMap.set(f.id, f);
+            }
+            if (data.food_remove) {
+                for (const id of data.food_remove) foodMap.delete(id);
             }
             // ── Ejected food – ažuriraj pozicije (kreću se svaki tik) ──
             if (data.ejected) {
@@ -329,6 +328,7 @@
           document.getElementById('dead-overlay').style.display = 'flex';
           gameState.myPlayerId = null;
           gameState.cells = [];
+          foodMap.clear();   // ← briši sve ghost food pre novog snapshot-a
           break;
 
         case 'pong':

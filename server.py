@@ -29,6 +29,7 @@ EJECT_COST        = 18.0
 EJECT_MASS        = 14.0
 SPLIT_MIN_MASS    = 36.0
 MAX_SPLITS        = 16
+START_MASS        = 50.0
 VIRUS_SPLIT_MASS  = 133.0
 VIRUS_FEED_COUNT  = 7           # koliko peleta virus mora da pojede da se podeli
 GRID_CELL_SIZE    = 250         # velicina spatial grid celije
@@ -42,8 +43,17 @@ VIRUS_RESPAWN_MARGIN    = 350.0  # minimalni razmak od igrača pri respawnu viru
 VIRUS_SPLIT_GAP         = 55.0   # razmak između centra starog i novog virusa
 VIRUS_LAUNCH_SPEED      = 6.0    # brzina novog virusa pri odvajanju
 EJECT_DISTANCE          = 28.0   # udaljenost peleta od ivice ćelije
-EJECT_COOLDOWN_TIME     = 0.6    # sekundi pre nego što ejected peleta može biti pojedena
-SPLIT_LAUNCH_SPEED      = 22.0   # početna brzina splita (world-units/tick)
+SPLIT_LAUNCH_SPEED      = 30.0   # jači katapult – lansira se kao projektil
+SPLIT_LAUNCH_DURATION   = 0.42   # sekundi u balističkoj fazi (bez privlačenja miša)
+
+# ─── BOT AI KONSTANTE ────────────────────────────────────────────────────────
+BOT_HUNT_SPLIT_RATIO    = 2.0    # Bot treba 2× masu target ćelije za hunt-split
+BOT_FLEE_SPLIT_RATIO    = 1.8    # Flee-split ako je pretnja 1.8× veća od naše max ćelije
+BOT_DANGER_RADIUS       = 480.0  # Radijus detekcije pretnji (world-units)
+BOT_HUNT_RADIUS         = 560.0  # Maksimalni domašaj lova na ćelije
+BOT_FOOD_RADIUS         = 750.0  # Maksimalni radijus pretrage hrane
+BOT_VIRUS_AVOID_RADIUS  = 110.0  # Dodatna margina zaobilaženja virusa
+BOT_SPLIT_COOLDOWN      = 7.0    # Sekundi između dva bota-splita (anti-spam)
 
 BOT_NAMES = [
     "Moose","Panda","Rex","Nova","Ace","Zara","Kira","Bolt",
@@ -78,6 +88,7 @@ class Cell:
     vx: float = 0.0
     vy: float = 0.0
     merge_timer: float = 0.0   # sekundi pre nego sto moze da se spoji
+    launch_timer: float = 0.0   # ← dok > 0, ćelija leti balistički (ignoriše miš)
 
     @property
     def radius(self) -> float:
@@ -89,7 +100,7 @@ class Cell:
         # masa=50 → 5.4 u/t (normalnih 324 u/s)
         # masa=200 → 2.7 u/t (162 u/s)
         # masa=1000 → 1.2 u/t (72 u/s – i dalje pliva, ne stoji)
-        return max(1.2, 38.0 / math.sqrt(self.mass))
+        return max(0.6, min(5.4, 38.0 / math.sqrt(self.mass)))
 
 # NOVO – dodajemo cooldown da se peleta ne može odmah pojesti:
 @dataclass
@@ -102,7 +113,7 @@ class FoodPellet:
     vx: float = 0.0
     vy: float = 0.0
     ejected: bool = False
-    eject_cooldown: float = 0.0   # ← dok > 0, ne može biti pojedena
+
 
 # NOVO – dodajemo vx/vy da virus može biti "ispaljen":
 @dataclass
@@ -137,6 +148,7 @@ class Player:
     think_timer: float = 0.0
     bot_tx: float = WORLD_SIZE / 2.0
     bot_ty: float = WORLD_SIZE / 2.0
+    bot_split_cooldown: float = 0.0   # ← NOVO: štoparca za bot split
 
     @property
     def total_mass(self) -> float:
@@ -218,7 +230,7 @@ class GameWorld:
         start_x = rnd(200, WORLD_SIZE - 200)
         start_y = rnd(200, WORLD_SIZE - 200)
         cell = Cell(id=new_id(), owner_id=pid,
-                    x=start_x, y=start_y, mass=50.0)
+                    x=start_x, y=start_y, mass=START_MASS)
         player = Player(
             player_id=pid, session_id=session_id,
             name=name, hue=hue, cells=[cell], is_bot=is_bot
@@ -292,6 +304,20 @@ def nearby_food_ids(grid: dict, cx: float, cy: float, radius: float):
 
 # ─── FIZIKA ──────────────────────────────────────────────────────────────────
 def move_cell(cell: Cell, tx: float, ty: float, dt: float):
+    # ── Balastička faza: ćelija leti kao projektil, miš nema uticaj ──
+    # Aktivno odmah posle splita (launch_timer > 0).
+    # Trenje 0.88 po tiku = ista deceleracija kao virus i ejected food.
+    # Posle launch_timer = 0, prelazi na normalno kretanje.
+    if cell.launch_timer > 0:
+        cell.launch_timer = max(0.0, cell.launch_timer - dt)
+        cell.vx *= 0.88
+        cell.vy *= 0.88
+        r = cell.radius
+        cell.x = clamp(cell.x + cell.vx, r, WORLD_SIZE - r)
+        cell.y = clamp(cell.y + cell.vy, r, WORLD_SIZE - r)
+        return   # ← preskoči normalno kretanje dok traje faza lansiranja
+
+    # ── Normalno kretanje (privlačenje prema mišu) ──
     dx = tx - cell.x
     dy = ty - cell.y
     d = math.hypot(dx, dy) or 1.0
@@ -319,13 +345,18 @@ def update_merge_timer(cell: Cell, dt: float):
         cell.merge_timer = max(0.0, cell.merge_timer - dt)
 
 def update_ejected_food(world: GameWorld, dt: float):
-    for fid, f in list(world.food.items()):
-        # NOVO: dekrementiraj cooldown za SVU hranu (cost je minimalan)
-        if f.eject_cooldown > 0:
-            f.eject_cooldown = max(0.0, f.eject_cooldown - dt)
+    """
+    Pomera ispaljene peleti (W) i obrađuje kolizije sa virusima.
+    Kad ejected peleta udari virus → briše se POTPUNO iz igre (ne konvertuje u obicnu hranu).
+    Klijent dobija obaveštenje kroz food_removed_tick dirty flag.
+    """
+    to_delete = set()   # fid-ovi peleta koje treba potpuno ukloniti
 
+    for fid, f in list(world.food.items()):
         if not f.ejected:
             continue
+
+        # ── Fizika kretanja peleti ──
         f.x += f.vx
         f.y += f.vy
         f.vx *= 0.88
@@ -333,20 +364,20 @@ def update_ejected_food(world: GameWorld, dt: float):
         f.x = clamp(f.x, 0, WORLD_SIZE)
         f.y = clamp(f.y, 0, WORLD_SIZE)
 
-        for vid, v in list(world.viruses.items()):
+        # ── Kolizija sa virusom ──
+        for _, v in list(world.viruses.items()):
             if dist2(f.x, f.y, v.x, v.y) < v.radius + mass_to_radius(f.mass):
-                f.ejected = False
-                f.mass = 1.0
-                f.eject_cooldown = 0.0
+                # Peleta NESTAJE iz igre (ne postaje obicna hrana)
+                to_delete.add(fid)
+
+                # Virus i dalje prima ishranu (mehanika hranjenja virusa ostaje)
                 v.fed_count += 1
                 if v.fed_count >= VIRUS_FEED_COUNT:
                     v.fed_count = 0
                     if len(world.viruses) < VIRUS_COUNT + 5:
-                        # NOVO: novi virus se lansira u smeru peleta
                         angle = math.atan2(f.vy, f.vx) if (
                             abs(f.vx) > 0.01 or abs(f.vy) > 0.01
                         ) else random.uniform(0, math.pi * 2)
-
                         gap = v.radius * 2 + VIRUS_SPLIT_GAP
                         nv_id = new_id()
                         nv = Virus(
@@ -357,7 +388,16 @@ def update_ejected_food(world: GameWorld, dt: float):
                             vy=math.sin(angle) * VIRUS_LAUNCH_SPEED
                         )
                         world.viruses[nv_id] = nv
-                break
+                break   # jedna peleta može pogoditi samo jedan virus
+
+    # ── Potpuno brisanje peleta koje su udarile virus ──
+    # Klijent dobija ID-jeve kroz food_removed_tick i briše ih iz foodMap
+    for fid in to_delete:
+        if fid in world.food:
+            world.food.pop(fid)
+            world.food_removed_tick.append(fid)   # dirty flag za klijenta
+    if to_delete:
+        world._food_grid_valid = False
 
 def update_viruses(world: GameWorld, dt: float):
     """Pomera viruse koji su 'ispaljivani' pri deljenju (dok se ne zaustave)."""
@@ -442,10 +482,16 @@ def do_split(player: Player):
         child = Cell(id=new_id(), owner_id=player.player_id,
                      x=cell.x, y=cell.y, mass=half)
 
+        child.x = clamp(cell.x + (dx / d) * 1.5,
+                        child.radius, WORLD_SIZE - child.radius)
+        child.y = clamp(cell.y + (dy / d) * 1.5,
+                        child.radius, WORLD_SIZE - child.radius)
+
         # NOVO: fiksna lansirna brzina – ne zavisi od mase
         # Ćelija se "ispali" kao projektil, zatim usporava prirodno
         child.vx = (dx / d) * SPLIT_LAUNCH_SPEED
         child.vy = (dy / d) * SPLIT_LAUNCH_SPEED
+        child.launch_timer = SPLIT_LAUNCH_DURATION   # ← balastička faza
 
         merge_t = MERGE_TIME + half * 0.015
         child.merge_timer = merge_t
@@ -468,21 +514,18 @@ def do_eject(player: Player, world: GameWorld):
         ex = cell.x + (dx / d) * (cell.radius + EJECT_DISTANCE)
         ey = cell.y + (dy / d) * (cell.radius + EJECT_DISTANCE)
         
-        fid = world._add_food_pellet(
+        # NOVO – uklanjamo cooldown blok, samo spawn:
+        world._add_food_pellet(
             x=ex, y=ey, mass=EJECT_MASS,
             hue=player.hue,
             vx=(dx / d) * 10.0,
             vy=(dy / d) * 10.0,
             ejected=True
-        )
-        # NOVO: postavi cooldown da se peleta ne može odmah pojesti
-        # (sprečava bug gde ćelija pojede svoju sopstvenu peletu)
-        if fid in world.food:
-            world.food[fid].eject_cooldown = EJECT_COOLDOWN_TIME
+            )
 
 # ─── VIRUS POP ───────────────────────────────────────────────────────────────
 def pop_cell(cell: Cell, player: Player):
-    pops = min(8, MAX_SPLITS - len(player.cells) + 1)
+    pops = min(6, MAX_SPLITS - len(player.cells) + 1)
     if pops <= 0:
         return
     new_cells = []
@@ -521,9 +564,7 @@ def resolve_collisions(world: GameWorld):
                 f = world.food.get(fid)
                 if f is None:
                     continue
-                # NOVO: preskoči hranu koja je još u cooldown-u
-                if f.eject_cooldown > 0:
-                    continue
+
                 if dist2(cell.x, cell.y, f.x, f.y) < cell.radius:
                     cell.mass += f.mass
                     eaten_food.add(fid)
@@ -582,54 +623,185 @@ def resolve_collisions(world: GameWorld):
 
 # ─── BOT AI ──────────────────────────────────────────────────────────────────
 def update_bot_ai(bot: Player, world: GameWorld, dt: float):
+    """
+    Bot AI sa četiri prioritetne faze:
+      1. Detekcija opasnosti i bekstvo (uz opcioni flee-split)
+      2. Zaobilaženje virusa bez panike
+      3. Lov na konkretne manje ćelije (uz opcioni hunt-split)
+      4. Sakupljanje hrane (uz zaobilaženje hrane blizu virusa)
+    """
+
+    # ── Uvek dekrementiraj split cooldown, bez obzira na think_timer ──
+    if bot.bot_split_cooldown > 0:
+        bot.bot_split_cooldown = max(0.0, bot.bot_split_cooldown - dt)
+
     bot.think_timer -= dt
     if bot.think_timer > 0:
         return
+    # Kraći interval = reaktivniji botovi
+    bot.think_timer = rnd(0.15, 0.35)
 
-    bot.think_timer = rnd(0.3, 0.9)
-    best_target = None
-    best_score = float('inf')
+    if not bot.cells:
+        return
 
-    # Traži obližnju hranu
-    for f in world.food.values():
-        d = dist2(bot.cx, bot.cy, f.x, f.y)
-        if d < best_score:
-            best_score = d
-            best_target = (f.x, f.y)
+    bot_cx  = bot.cx
+    bot_cy  = bot.cy
+    # Masa NAJVEĆE ćelije bota – ovo je ono što protivnik mora da ima > 1.15×
+    bot_max = max(c.mass for c in bot.cells)
 
-    # Juri manje igrače
-    bot_mass = bot.total_mass
+    # ════════════════════════════════════════════════════
+    # FAZA 1: OPASNOST – procena na nivou ćelije
+    # ════════════════════════════════════════════════════
+    danger_cell  = None
+    danger_dist  = float('inf')
+
     for other in world.players.values():
         if other.player_id == bot.player_id or other.dead:
             continue
-        if other.total_mass * 1.2 < bot_mass:
-            d = dist2(bot.cx, bot.cy, other.cx, other.cy)
-            if d < best_score * 0.6:
-                best_score = d
-                best_target = (other.cx, other.cy)
+        for cell in other.cells:
+            # Ova konkretna ćelija može da POJEDE našu najveću ćeliju
+            if cell.mass > bot_max * 1.15:
+                d = dist2(bot_cx, bot_cy, cell.x, cell.y)
+                if d < BOT_DANGER_RADIUS and d < danger_dist:
+                    danger_dist  = d
+                    danger_cell  = cell
 
-    # Beži od većih igrača
-    for other in world.players.values():
-        if other.player_id == bot.player_id or other.dead:
-            continue
-        if other.total_mass * 1.2 > bot_mass:
-            d = dist2(bot.cx, bot.cy, other.cx, other.cy)
-            if d < 400:
-                # Pobegni u suprotnom smeru
-                flee_x = bot.cx * 2 - other.cx
-                flee_y = bot.cy * 2 - other.cy
-                bot.bot_tx = clamp(flee_x, 0, WORLD_SIZE)
-                bot.bot_ty = clamp(flee_y, 0, WORLD_SIZE)
+    if danger_cell is not None:
+        # Izračunaj smer bekstva (direktno suprotno od opasne ćelije)
+        flee_x = bot_cx * 2.0 - danger_cell.x
+        flee_y = bot_cy * 2.0 - danger_cell.y
+        bot.bot_tx   = clamp(flee_x, 80, WORLD_SIZE - 80)
+        bot.bot_ty   = clamp(flee_y, 80, WORLD_SIZE - 80)
+        bot.target_x = bot.bot_tx
+        bot.target_y = bot.bot_ty
+
+        # ── FLEE-SPLIT: Podeli se da bi manji fragmenti pobegli brže ──
+        # Manji komadi imaju veću brzinu (speed = 38/sqrt(masa))
+        # Koristiti samo ako je pretnja znatno veća i ima smisla
+        can_flee_split = (
+            danger_cell.mass > bot_max * BOT_FLEE_SPLIT_RATIO
+            and bot_max >= SPLIT_MIN_MASS * 2.0
+            and len(bot.cells) < MAX_SPLITS // 2      # ne splituj do maksimuma
+            and bot.bot_split_cooldown <= 0
+            and danger_dist < BOT_DANGER_RADIUS * 0.55 # samo ako je blizu
+        )
+        if can_flee_split:
+            # Postavi target u smeru bekstva, pa split
+            bot.wants_split      = True
+            bot.bot_split_cooldown = BOT_SPLIT_COOLDOWN
+        return  # bekstvo ima apsolutni prioritet
+
+    # ════════════════════════════════════════════════════
+    # FAZA 2: ZAOBILAŽENJE VIRUSA (bez panike)
+    # Aktivno samo ako naša najveća ćelija može biti raznesena
+    # ════════════════════════════════════════════════════
+    if bot_max > VIRUS_SPLIT_MASS:
+        for v in world.viruses.values():
+            # Opasna zona = radius virusa + radius naše ćelije + margina
+            danger_margin = v.radius + mass_to_radius(bot_max) + BOT_VIRUS_AVOID_RADIUS
+            dv = dist2(bot_cx, bot_cy, v.x, v.y)
+            if dv < danger_margin:
+                # Bočno zaobilaženje: kombinuj vektor "nazad" i "bočno"
+                # da bi bot glatko zaobišao, ne zaustavio se
+                vdx = bot_cx - v.x
+                vdy = bot_cy - v.y
+                vd  = math.hypot(vdx, vdy) or 1.0
+                # Normalizovani vektor od virusa ka botu
+                nx_v, ny_v = vdx / vd, vdy / vd
+                # Perpendikularni vektor (bočno skretanje)
+                perp_x, perp_y = -ny_v, nx_v
+                # Kombinuj: 60% nazad + 40% bočno
+                steer_x = bot_cx + (nx_v * 0.6 + perp_x * 0.4) * 280
+                steer_y = bot_cy + (ny_v * 0.6 + perp_y * 0.4) * 280
+                bot.bot_tx   = clamp(steer_x, 80, WORLD_SIZE - 80)
+                bot.bot_ty   = clamp(steer_y, 80, WORLD_SIZE - 80)
                 bot.target_x = bot.bot_tx
                 bot.target_y = bot.bot_ty
-                return
+                return  # zaobilaženje virusa je hitno
 
-    if best_target:
-        bot.bot_tx = best_target[0]
-        bot.bot_ty = best_target[1]
+    # ════════════════════════════════════════════════════
+    # FAZA 3: LOV – procena na nivou ĆELIJE (ne ukupne mase igrača!)
+    # ════════════════════════════════════════════════════
+    hunt_cell   = None
+    hunt_score  = float('inf')
+
+    for other in world.players.values():
+        if other.player_id == bot.player_id or other.dead:
+            continue
+        for cell in other.cells:
+            # Naša max ćelija može da POJEDE ovu konkretnu ćeliju
+            if bot_max > cell.mass * 1.15:
+                d = dist2(bot_cx, bot_cy, cell.x, cell.y)
+                if d < BOT_HUNT_RADIUS:
+                    # Skor: manji = bolji cilj (preferujemo bliže I masivnije)
+                    # Deljenjem sa (cell.mass+1) dajemo bonus masivnijim ćelijama
+                    score = d / (cell.mass + 1.0)
+                    if score < hunt_score:
+                        hunt_score = score
+                        hunt_cell  = cell
+
+    if hunt_cell is not None:
+        bot.bot_tx   = hunt_cell.x
+        bot.bot_ty   = hunt_cell.y
+        bot.target_x = bot.bot_tx
+        bot.target_y = bot.bot_ty
+
+        # ── HUNT-SPLIT: Ispali split prema cilju ──
+        # Logika: ako imamo duplu masu i cilj je dovoljno blizu,
+        # split-projektil (brzina 30 u/t) može dosegnuti cilj
+        # pre nego što se cilj pomeri van dometa
+        d_to_hunt = dist2(bot_cx, bot_cy, hunt_cell.x, hunt_cell.y)
+        can_hunt_split = (
+            bot_max >= hunt_cell.mass * BOT_HUNT_SPLIT_RATIO
+            and d_to_hunt < 340
+            and len(bot.cells) < MAX_SPLITS // 2
+            and bot_max >= SPLIT_MIN_MASS * 2.0
+            and bot.bot_split_cooldown <= 0
+        )
+        if can_hunt_split:
+            bot.wants_split      = True
+            bot.bot_split_cooldown = BOT_SPLIT_COOLDOWN
+        return
+
+    # ════════════════════════════════════════════════════
+    # FAZA 4: SAKUPLJANJE HRANE
+    # Koristimo spatial grid za efikasnu lokalnu pretragu.
+    # Preskačemo hranu koja leži unutar virusa (može nas namamiti u zamku).
+    # ════════════════════════════════════════════════════
+    food_grid   = world.get_food_grid()
+    nearby_fids = nearby_food_ids(food_grid, bot_cx, bot_cy, BOT_FOOD_RADIUS)
+
+    best_food   = None
+    best_food_d = float('inf')
+
+    for fid in nearby_fids:
+        f = world.food.get(fid)
+        if f is None or f.ejected:
+            continue
+
+        # Preskači hranu u neposrednoj blizini virusa
+        # (samo ako nas virus može raznet)
+        if bot_max > VIRUS_SPLIT_MASS:
+            near_virus = False
+            for v in world.viruses.values():
+                if dist2(f.x, f.y, v.x, v.y) < v.radius + 45:
+                    near_virus = True
+                    break
+            if near_virus:
+                continue
+
+        d = dist2(bot_cx, bot_cy, f.x, f.y)
+        if d < best_food_d:
+            best_food_d = d
+            best_food   = f
+
+    if best_food is not None:
+        bot.bot_tx = best_food.x
+        bot.bot_ty = best_food.y
     else:
-        bot.bot_tx = rnd(0, WORLD_SIZE)
-        bot.bot_ty = rnd(0, WORLD_SIZE)
+        # Wandering: idi na novu nasumičnu lokaciju
+        bot.bot_tx = rnd(200, WORLD_SIZE - 200)
+        bot.bot_ty = rnd(200, WORLD_SIZE - 200)
 
     bot.target_x = bot.bot_tx
     bot.target_y = bot.bot_ty
@@ -822,6 +994,23 @@ async def game_loop():
             world.refill_viruses()
 
             # ── 7. Broadcast tick ──
+
+            # NOVO: Deduplikacija dirty listi.
+            # Ako je peleta i DODANA i UKLONJENA u istom tiku
+            # (npr. ispaljena i odmah pojedena, ili odmah udarila virus),
+            # ne šaljemo je ni u food_add ni u food_remove klijentu.
+            # Bez ovoga klijent dobija ghost food koji nikad ne nestaje.
+            if world.food_removed_tick:
+                removed_set = set(world.food_removed_tick)
+                world.food_added_tick = [
+                    f for f in world.food_added_tick
+                    if f["id"] not in removed_set
+                ]
+                # Isto tako, ne treba slati remove za peletu
+                # koju klijent još nije ni dobio (nije bila u food_add ranije)
+                # – ovo je bezbedno ostaviti jer foodMap.delete na nepostojeci
+                # kljuc je no-op u JS, ali čistije je ovako
+
             await broadcast_ticks()
             world.food_added_tick.clear()
             world.food_removed_tick.clear()
